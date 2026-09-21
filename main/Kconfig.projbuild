@@ -1,0 +1,26 @@
+menu "Wi-Fi provisioning"
+
+config PROV_AP_SSID_PREFIX
+    string "Provisioning AP SSID prefix"
+    default "ESP32-S3"
+
+config PROV_AP_PASSWORD
+    string "Provisioning AP password (8-63 characters)"
+    default "12345678"
+
+config PROV_CONNECT_TIMEOUT_SECONDS
+    int "Saved network connection timeout"
+    range 5 120
+    default 30
+
+config PROV_BOOT_BUTTON_GPIO
+    int "BOOT button GPIO"
+    range 0 48
+    default 0
+
+config PROV_BOOT_BUTTON_HOLD_MS
+    int "Hold time to erase Wi-Fi configuration (ms)"
+    range 1000 10000
+    default 3000
+
+endmenu

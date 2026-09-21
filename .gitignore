@@ -1,0 +1,31 @@
+# ESP-IDF generated build trees (including archived pre-rename caches).
+/build/
+/build-*/
+
+# Recreated by ESP-IDF Component Manager from dependencies.lock.
+/managed_components/
+/.idf_component_manager/
+
+# OpenWrt deployment scripts and device-specific API defaults stay local.
+/openwrt/
+
+# Local editor and tooling state.
+/.vscode/
+/.idea/
+/.cache/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*~
+
+# Local ESP-IDF configuration backups; keep sdkconfig and sdkconfig.defaults.
+/sdkconfig.old
+/sdkconfig.old.*
+/sdkconfig.*.backup
+
+# Logs and crash dumps.
+*.log
+*.core
+core.*
