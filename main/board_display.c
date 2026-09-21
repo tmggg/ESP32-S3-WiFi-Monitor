@@ -139,9 +139,9 @@ esp_err_t board_display_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, true), TAG, "panel rotation failed");
-    /* Match the vendor demo's LV_DISP_ROT_90 orientation. After swapping the
-     * axes, the panel's native X offset becomes the logical Y gap. */
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel, true, true), TAG, "panel mirror failed");
+    /* With XY swapped, panel Y controls logical left/right. Flip that axis
+     * to correct the horizontally mirrored image seen on the S3 panel. */
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel, false, false), TAG, "panel mirror failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(s_panel, 0, LCD_Y_GAP), TAG, "panel gap failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "panel on failed");
     ESP_RETURN_ON_ERROR(init_backlight(), TAG, "backlight failed");

@@ -2,3 +2,5 @@
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, 0x10000, 0x300000,
+# About 80% of the flash left after the factory app; raw storage, not mounted.
+storage,  data,  0x40,    0x310000, 0xA50000,

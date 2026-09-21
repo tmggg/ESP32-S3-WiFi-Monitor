@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "board_display.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "openwrt_status.h"
@@ -54,7 +56,7 @@ typedef struct {
     uint32_t count;
 } traffic_history_t;
 
-static traffic_history_t s_interface_histories[OPENWRT_MAX_INTERFACES];
+static traffic_history_t *s_interface_histories;
 static uint32_t s_last_sample_id;
 static bool s_was_high_traffic;
 static int8_t s_manual_history_slot = -1;
@@ -391,8 +393,19 @@ static lv_obj_t *make_liquid_card(lv_obj_t *parent, liquid_card_t *liquid,
     return card;
 }
 
-void status_dashboard_init(void)
+esp_err_t status_dashboard_init(void)
 {
+    /* History is read once per sample/redraw, so keep it in PSRAM. The hot
+     * Canvas and SPI DMA buffers remain in internal RAM for display speed. */
+    s_interface_histories = heap_caps_calloc(OPENWRT_MAX_INTERFACES,
+                                             sizeof(*s_interface_histories),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_interface_histories) {
+        ESP_LOGE("dashboard", "Failed to allocate %u bytes of interface history in PSRAM",
+                 (unsigned)(OPENWRT_MAX_INTERFACES * sizeof(*s_interface_histories)));
+        return ESP_ERR_NO_MEM;
+    }
+
     board_display_lock();
     lv_obj_t *screen = lv_scr_act();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x09111F), 0);
@@ -412,8 +425,8 @@ void status_dashboard_init(void)
 
     make_liquid_card(screen, &s_cpu_liquid, s_cpu_canvas_buffer,
                      2, 28, SMALL_CARD_WIDTH, SMALL_CARD_HEIGHT, "CPU",
-                     lv_color_hex(0x44D7B6), lv_color_hex(0x167A68),
-                     lv_color_hex(0x7DF2D6), 22, &s_cpu);
+                     lv_color_hex(0xA8E66A), lv_color_hex(0x527A2A),
+                     lv_color_hex(0xD4F5A3), 22, &s_cpu);
     s_memory_liquid.phase_offset = 10;
     make_liquid_card(screen, &s_memory_liquid, s_memory_canvas_buffer,
                      82, 28, SMALL_CARD_WIDTH, SMALL_CARD_HEIGHT, "MEM",
@@ -532,6 +545,11 @@ void status_dashboard_init(void)
     lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
     start_liquid_wave_animation();
     board_display_unlock();
+    ESP_LOGI("dashboard", "Interface history: %u bytes in PSRAM; internal free: %u, PSRAM free: %u bytes",
+             (unsigned)(OPENWRT_MAX_INTERFACES * sizeof(*s_interface_histories)),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return ESP_OK;
 }
 
 static void format_rate(uint64_t bytes_per_second, char *output, size_t size)

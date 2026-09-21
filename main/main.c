@@ -29,9 +29,9 @@ static void display_task(void *arg)
     while (true) {
         TickType_t now = xTaskGetTickCount();
         if (!display_dimmed && now - display_started >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS)) {
-            board_display_set_brightness(50);
+            board_display_set_brightness(25);
             display_dimmed = true;
-            ESP_LOGI(TAG, "Display brightness reduced to 50%%");
+            ESP_LOGI(TAG, "Display brightness reduced to 25%%");
         }
         if (now - last_update >= pdMS_TO_TICKS(500)) {
             status_dashboard_update();
@@ -65,7 +65,7 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
     ESP_ERROR_CHECK(board_display_init());
     ESP_ERROR_CHECK(cpu_load_led_start());
-    status_dashboard_init();
+    ESP_ERROR_CHECK(status_dashboard_init());
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(openwrt_status_start());
     BaseType_t display_created = xTaskCreatePinnedToCore(
