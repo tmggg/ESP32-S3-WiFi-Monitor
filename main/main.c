@@ -2,6 +2,7 @@
 #include "board_display.h"
 #include "cpu_load_led.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -24,6 +25,11 @@ static void display_task(void *arg)
     TickType_t last_update = 0;
     TickType_t last_frame_wake = display_started;
     uint32_t frame_tick_remainder = 0;
+    int64_t perf_window_started = esp_timer_get_time();
+    uint64_t handler_total_us = 0;
+    uint32_t handler_max_us = 0;
+    uint32_t handler_calls = 0;
+    uint32_t handler_over_budget = 0;
     bool display_dimmed = false;
 
     while (true) {
@@ -43,7 +49,27 @@ static void display_task(void *arg)
             display_dimmed = false;
             ESP_LOGI(TAG, "Manual page switch: brightness set to 50%%; dim timer reset");
         }
+        int64_t handler_started = esp_timer_get_time();
         board_display_handle();
+        uint32_t handler_us = (uint32_t)(esp_timer_get_time() - handler_started);
+        handler_total_us += handler_us;
+        if (handler_us > handler_max_us) handler_max_us = handler_us;
+        if (handler_us > 16667) handler_over_budget++;
+        handler_calls++;
+
+        int64_t perf_now = esp_timer_get_time();
+        if (perf_now - perf_window_started >= 10000000) {
+            ESP_LOGI(TAG, "LVGL/10s: calls=%lu avg=%llu us max=%lu us >16.7ms=%lu",
+                     (unsigned long)handler_calls,
+                     (unsigned long long)(handler_calls ? handler_total_us / handler_calls : 0),
+                     (unsigned long)handler_max_us,
+                     (unsigned long)handler_over_budget);
+            perf_window_started = perf_now;
+            handler_total_us = 0;
+            handler_max_us = 0;
+            handler_calls = 0;
+            handler_over_budget = 0;
+        }
 
         /* Fractional tick scheduler: at the default 100 Hz FreeRTOS tick this
          * alternates 1/2/2 ticks, averaging exactly 60 handler calls/second. */

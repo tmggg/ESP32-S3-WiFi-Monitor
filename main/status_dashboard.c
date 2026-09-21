@@ -77,6 +77,9 @@ typedef struct {
     int16_t height;
     int32_t level;
     int32_t target;
+    int32_t rendered_level;
+    int32_t rendered_phase;
+    bool title_white;
     uint8_t phase_offset;
     lv_color_t accent;
     lv_color_t water;
@@ -103,6 +106,18 @@ typedef struct {
 
 static chart_redraw_animation_t s_redraw_animation;
 
+static void set_label_if_changed(lv_obj_t *label, const char *text)
+{
+    if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static void set_traffic_page_visible(bool visible)
+{
+    bool hidden = lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+    if (visible && hidden) lv_obj_clear_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+    else if (!visible && !hidden) lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void animate_waveform_redraw(void *context, int32_t visible_points)
 {
     chart_redraw_animation_t *redraw = context;
@@ -116,7 +131,7 @@ static void animate_waveform_redraw(void *context, int32_t visible_points)
     }
 }
 
-static void start_waveform_redraw(int history_slot)
+static void start_waveform_redraw(int history_slot, bool animate)
 {
     if (history_slot < 0 || history_slot >= OPENWRT_MAX_INTERFACES) return;
     traffic_history_t *history = &s_interface_histories[history_slot];
@@ -130,8 +145,10 @@ static void start_waveform_redraw(int history_slot)
         lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_PRIMARY_X,
                            0, s_x_window_seconds);
     }
-    lv_chart_set_all_value(s_traffic_chart, s_download_series, LV_CHART_POINT_NONE);
-    lv_chart_set_all_value(s_traffic_chart, s_upload_series, LV_CHART_POINT_NONE);
+    if (animate) {
+        lv_chart_set_all_value(s_traffic_chart, s_download_series, LV_CHART_POINT_NONE);
+        lv_chart_set_all_value(s_traffic_chart, s_upload_series, LV_CHART_POINT_NONE);
+    }
     s_redraw_animation.point_count = history->count;
     s_redraw_animation.revealed = 0;
 
@@ -150,6 +167,22 @@ static void start_waveform_redraw(int history_slot)
     uint32_t chart_max = peak + peak / 5;
     if (chart_max > CHART_VALUE_LIMIT) chart_max = CHART_VALUE_LIMIT;
     lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_SECONDARY_Y, 0, chart_max);
+
+    if (!animate) {
+        /* A new one-second sample shifts the visible history. Update the
+         * series in place and invalidate the chart only once, rather than
+         * scheduling 2 * point_count individual point invalidations. */
+        lv_coord_t *download = lv_chart_get_y_array(s_traffic_chart, s_download_series);
+        lv_coord_t *upload = lv_chart_get_y_array(s_traffic_chart, s_upload_series);
+        if (download && upload) {
+            for (uint32_t i = 0; i < s_x_window_seconds; ++i) {
+                download[i] = i < history->count ? s_redraw_animation.download[i] : LV_CHART_POINT_NONE;
+                upload[i] = i < history->count ? s_redraw_animation.upload[i] : LV_CHART_POINT_NONE;
+            }
+            lv_chart_refresh(s_traffic_chart);
+        }
+        return;
+    }
 
     lv_anim_t animation;
     lv_anim_init(&animation);
@@ -185,16 +218,15 @@ bool status_dashboard_process_ui_requests(void)
         lv_label_set_text(s_traffic_alert_rate, "D -- Mbps");
         lv_label_set_text(s_traffic_alert_upload_rate, "U -- Mbps");
         lv_label_set_text(s_traffic_alert_stats, "AVG D/U --/--  MAX --/--");
-        start_waveform_redraw(s_manual_history_slot);
+        start_waveform_redraw(s_manual_history_slot, true);
         s_visible_history_slot = s_manual_history_slot;
         s_was_high_traffic = true;
-        lv_obj_clear_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_traffic_alert);
+        set_traffic_page_visible(true);
     } else {
         lv_anim_del(&s_redraw_animation, NULL);
         s_visible_history_slot = -1;
         s_was_high_traffic = false;
-        lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+        set_traffic_page_visible(false);
     }
     board_display_unlock();
     return true;
@@ -252,6 +284,19 @@ static lv_obj_t *make_value(lv_obj_t *parent, int y)
     return label;
 }
 
+static int32_t liquid_surface(const liquid_card_t *liquid, int32_t x,
+                              int32_t level, int32_t phase, const int8_t *wave_y)
+{
+    int32_t surface = liquid->height - (liquid->height * level + 50) / 100;
+    if (level >= 100) surface = 0;
+    else if (level > 0) {
+        surface += wave_y[(x + phase + liquid->phase_offset) % LIQUID_WAVE_PERIOD];
+    }
+    if (surface < 0) surface = 0;
+    if (surface > liquid->height) surface = liquid->height;
+    return surface;
+}
+
 static void render_liquid_wave(liquid_card_t *liquid)
 {
     static const int8_t wave_y[LIQUID_WAVE_PERIOD] = {
@@ -263,28 +308,43 @@ static void render_liquid_wave(liquid_card_t *liquid)
         -5, -5, -4, -4, -3, -2, -2, -1,
     };
     const lv_color_t background = lv_color_hex(0x17233A);
-    int32_t fill_height = (liquid->height * liquid->level + 50) / 100;
-    int32_t surface_y = liquid->height - fill_height;
+    int32_t first_changed_y = liquid->height;
+    int32_t last_changed_y = -1;
+    bool first_render = liquid->rendered_level < 0;
 
     for (int32_t x = 0; x < liquid->width; ++x) {
-        int32_t wave_surface = surface_y;
-        if (liquid->level >= 100) {
-            wave_surface = 0;
-        } else if (liquid->level > 0) {
-            wave_surface += wave_y[(x + s_liquid_wave_phase + liquid->phase_offset) %
-                                   LIQUID_WAVE_PERIOD];
-        }
-        if (wave_surface < 0) wave_surface = 0;
-        if (wave_surface > liquid->height) wave_surface = liquid->height;
+        int32_t wave_surface = liquid_surface(liquid, x, liquid->level,
+                                               s_liquid_wave_phase, wave_y);
+        int32_t old_surface = first_render ? liquid->height :
+                              liquid_surface(liquid, x, liquid->rendered_level,
+                                             liquid->rendered_phase, wave_y);
+        int32_t from = first_render ? 0 :
+                       (wave_surface < old_surface ? wave_surface : old_surface);
+        int32_t to = first_render ? liquid->height - 1 :
+                     (wave_surface > old_surface ? wave_surface : old_surface);
+        if (from >= liquid->height) continue;
+        if (to >= liquid->height) to = liquid->height - 1;
+        if (!first_render && wave_surface == old_surface &&
+            (liquid->level == 0 || liquid->rendered_level == liquid->level)) continue;
 
-        for (int32_t y = 0; y < liquid->height; ++y) {
+        for (int32_t y = from; y <= to; ++y) {
             lv_color_t color = background;
             if (liquid->level > 0 && y >= wave_surface) color = liquid->water;
             if (liquid->level > 0 && y == wave_surface) color = liquid->crest;
             liquid->buffer[y * liquid->width + x] = color;
         }
+        if (from < first_changed_y) first_changed_y = from;
+        if (to > last_changed_y) last_changed_y = to;
     }
-    lv_obj_invalidate(liquid->canvas);
+    liquid->rendered_level = liquid->level;
+    liquid->rendered_phase = s_liquid_wave_phase;
+    if (last_changed_y >= first_changed_y) {
+        lv_area_t area;
+        lv_obj_get_coords(liquid->canvas, &area);
+        area.y1 += first_changed_y;
+        area.y2 = area.y1 + last_changed_y - first_changed_y;
+        lv_obj_invalidate_area(liquid->canvas, &area);
+    }
 }
 
 static void liquid_level_anim_cb(void *context, int32_t percent)
@@ -296,8 +356,12 @@ static void liquid_level_anim_cb(void *context, int32_t percent)
     liquid->level = percent;
     render_liquid_wave(liquid);
 
-    lv_obj_set_style_text_color(liquid->title,
-                                percent >= 75 ? lv_color_hex(0xFFFFFF) : liquid->accent, 0);
+    bool title_white = percent >= 75;
+    if (title_white != liquid->title_white) {
+        lv_obj_set_style_text_color(liquid->title,
+                                    title_white ? lv_color_hex(0xFFFFFF) : liquid->accent, 0);
+        liquid->title_white = title_white;
+    }
 }
 
 static void set_liquid_level(liquid_card_t *liquid, int32_t target)
@@ -374,6 +438,7 @@ static lv_obj_t *make_liquid_card(lv_obj_t *parent, liquid_card_t *liquid,
     liquid->height = height - 2;
     liquid->level = -1;
     liquid->target = -1;
+    liquid->rendered_level = -1;
     liquid->accent = accent;
     liquid->water = water;
     liquid->crest = crest;
@@ -382,6 +447,7 @@ static lv_obj_t *make_liquid_card(lv_obj_t *parent, liquid_card_t *liquid,
                          liquid->width, liquid->height,
                          LV_IMG_CF_TRUE_COLOR);
     lv_obj_set_pos(liquid->canvas, 1, 1);
+    lv_obj_update_layout(liquid->canvas);
 
     liquid->title = lv_label_create(card);
     lv_label_set_text(liquid->title, title);
@@ -607,12 +673,12 @@ static void update_traffic_speed_labels(
     format_scaled_mbps(max_down, d_max, sizeof(d_max));
     format_scaled_mbps(max_up, u_max, sizeof(u_max));
     snprintf(line, sizeof(line), "D %s Mbps", d_now);
-    lv_label_set_text(s_traffic_alert_rate, line);
+    set_label_if_changed(s_traffic_alert_rate, line);
     snprintf(line, sizeof(line), "U %s Mbps", u_now);
-    lv_label_set_text(s_traffic_alert_upload_rate, line);
+    set_label_if_changed(s_traffic_alert_upload_rate, line);
     snprintf(line, sizeof(line), "AVG D/U %s/%s  MAX %s/%s",
              d_avg, u_avg, d_max, u_max);
-    lv_label_set_text(s_traffic_alert_stats, line);
+    set_label_if_changed(s_traffic_alert_stats, line);
 }
 
 static void format_total(uint64_t bytes, char *output, size_t size)
@@ -755,49 +821,48 @@ void status_dashboard_update(void)
                               status.message[0] ? status.message : "NO DATA");
             lv_label_set_text(s_traffic_alert_upload_rate, "");
             lv_label_set_text(s_traffic_alert_stats, "AVG D/U --/--  MAX --/--");
-            lv_obj_clear_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(s_traffic_alert);
+            set_traffic_page_visible(true);
         } else {
             s_was_high_traffic = false;
-            lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+            set_traffic_page_visible(false);
         }
-        lv_label_set_text(s_connection, status.message[0] ? status.message : "OFFLINE");
+        set_label_if_changed(s_connection, status.message[0] ? status.message : "OFFLINE");
         lv_obj_set_style_text_color(s_connection, lv_color_hex(0xFFB84D), 0);
         board_display_unlock();
         return;
     }
 
     const openwrt_interface_status_t *default_interface = default_page_interface(&status);
-    lv_label_set_text(s_connection, default_interface ? default_interface->name : "NO IFACE");
-    lv_label_set_text(s_title, status.hostname[0] ? status.hostname : "OpenWrt");
+    set_label_if_changed(s_connection, default_interface ? default_interface->name : "NO IFACE");
+    set_label_if_changed(s_title, status.hostname[0] ? status.hostname : "OpenWrt");
     lv_obj_set_style_text_color(s_connection, lv_color_hex(0x44D7B6), 0);
     format_tenths(status.cpu_percent, "%", text, sizeof(text));
-    lv_label_set_text(s_cpu, text);
+    set_label_if_changed(s_cpu, text);
     set_liquid_level(&s_cpu_liquid, (int32_t)(status.cpu_percent + 0.5f));
     format_tenths(status.memory_percent, "%", text, sizeof(text));
-    lv_label_set_text(s_memory, text);
+    set_label_if_changed(s_memory, text);
     set_liquid_level(&s_memory_liquid, (int32_t)(status.memory_percent + 0.5f));
     format_tenths(status.temperature_c, " C", text, sizeof(text));
-    lv_label_set_text(s_temperature, text);
+    set_label_if_changed(s_temperature, text);
     set_liquid_level(&s_temperature_liquid, (int32_t)(status.temperature_c + 0.5f));
     format_uptime(status.uptime_seconds, text, sizeof(text));
-    lv_label_set_text(s_uptime, text);
+    set_label_if_changed(s_uptime, text);
     uint64_t default_download_bps = default_interface ? default_interface->download_bps : 0;
     uint64_t default_upload_bps = default_interface ? default_interface->upload_bps : 0;
     uint64_t default_download_bytes = default_interface ? default_interface->download_bytes : 0;
     uint64_t default_upload_bytes = default_interface ? default_interface->upload_bytes : 0;
     format_rate(default_download_bps, text, sizeof(text));
-    lv_label_set_text(s_download_speed, text);
+    set_label_if_changed(s_download_speed, text);
     set_liquid_level(&s_download_liquid,
                      rate_level(default_download_bps, DOWNLOAD_FULL_SCALE_BPS));
     format_total(default_download_bytes, text, sizeof(text));
-    lv_label_set_text(s_download_total, text);
+    set_label_if_changed(s_download_total, text);
     format_rate(default_upload_bps, text, sizeof(text));
-    lv_label_set_text(s_upload_speed, text);
+    set_label_if_changed(s_upload_speed, text);
     set_liquid_level(&s_upload_liquid,
                      rate_level(default_upload_bps, UPLOAD_FULL_SCALE_BPS));
     format_total(default_upload_bytes, text, sizeof(text));
-    lv_label_set_text(s_upload_total, text);
+    set_label_if_changed(s_upload_total, text);
 
     /* Keep a continuous one-sample-per-second history.  The traffic threshold
      * only controls whether the waveform page is visible; it no longer
@@ -814,7 +879,8 @@ void status_dashboard_update(void)
     if (display_slot >= 0) {
         if (new_traffic_sample || !s_was_high_traffic ||
             s_visible_history_slot != display_slot) {
-            start_waveform_redraw(display_slot);
+            start_waveform_redraw(display_slot, !s_was_high_traffic ||
+                                               s_visible_history_slot != display_slot);
         }
         s_visible_history_slot = display_slot;
         s_was_high_traffic = true;
@@ -831,13 +897,12 @@ void status_dashboard_update(void)
             lv_label_set_text(s_traffic_alert_title, "WAN HIGH UPLOAD");
         }
         update_traffic_speed_labels(display_slot, shown);
-        lv_obj_clear_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_traffic_alert);
+        set_traffic_page_visible(true);
     } else {
         if (s_was_high_traffic) lv_anim_del(&s_redraw_animation, NULL);
         s_was_high_traffic = false;
         s_visible_history_slot = -1;
-        lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+        set_traffic_page_visible(false);
     }
     board_display_unlock();
 }
