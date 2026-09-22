@@ -50,6 +50,7 @@ static void display_task(void *arg)
             ESP_LOGI(TAG, "Manual page switch: brightness set to 50%%; dim timer reset");
         }
         int64_t handler_started = esp_timer_get_time();
+        status_dashboard_animate_frame();
         board_display_handle();
         uint32_t handler_us = (uint32_t)(esp_timer_get_time() - handler_started);
         handler_total_us += handler_us;
@@ -59,11 +60,26 @@ static void display_task(void *arg)
 
         int64_t perf_now = esp_timer_get_time();
         if (perf_now - perf_window_started >= 10000000) {
+            board_display_perf_t lcd_perf;
+            status_dashboard_perf_t dashboard_perf;
+            board_display_take_perf(&lcd_perf);
+            status_dashboard_take_perf(&dashboard_perf);
             ESP_LOGI(TAG, "LVGL/10s: calls=%lu avg=%llu us max=%lu us >16.7ms=%lu",
                      (unsigned long)handler_calls,
                      (unsigned long long)(handler_calls ? handler_total_us / handler_calls : 0),
                      (unsigned long)handler_max_us,
                      (unsigned long)handler_over_budget);
+            ESP_LOGI(TAG, "LCD/10s: page=%s refresh=%lu flush=%lu DMA=%lu tx=%lu KiB wave CPU/MEM/TEMP/D/U=%lu/%lu/%lu/%lu/%lu",
+                     dashboard_perf.traffic_page_visible ? "traffic" : "default",
+                     (unsigned long)lcd_perf.refreshes,
+                     (unsigned long)lcd_perf.flushes,
+                     (unsigned long)lcd_perf.dma_completed,
+                     (unsigned long)(lcd_perf.pixels / 512U),
+                     (unsigned long)dashboard_perf.liquid_updates[0],
+                     (unsigned long)dashboard_perf.liquid_updates[1],
+                     (unsigned long)dashboard_perf.liquid_updates[2],
+                     (unsigned long)dashboard_perf.liquid_updates[3],
+                     (unsigned long)dashboard_perf.liquid_updates[4]);
             perf_window_started = perf_now;
             handler_total_us = 0;
             handler_max_us = 0;

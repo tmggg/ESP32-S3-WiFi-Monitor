@@ -68,6 +68,7 @@ static atomic_bool s_page_toggle_requested;
 static uint32_t s_x_window_seconds = TRAFFIC_DEFAULT_WINDOW_SECONDS;
 static int32_t s_liquid_wave_phase;
 static uint8_t s_liquid_render_slot;
+static uint32_t s_liquid_updates[5];
 
 typedef struct {
     lv_obj_t *canvas;
@@ -91,6 +92,18 @@ static liquid_card_t s_memory_liquid;
 static liquid_card_t s_temperature_liquid;
 static liquid_card_t s_download_liquid;
 static liquid_card_t s_upload_liquid;
+
+void status_dashboard_take_perf(status_dashboard_perf_t *perf)
+{
+    if (!perf) return;
+    perf->traffic_page_visible = s_traffic_alert &&
+                                 !lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+    for (uint32_t i = 0; i < 5; ++i) {
+        perf->liquid_updates[i] = s_liquid_updates[i];
+        s_liquid_updates[i] = 0;
+    }
+}
+
 static lv_color_t s_cpu_canvas_buffer[(SMALL_CARD_WIDTH - 2) * (SMALL_CARD_HEIGHT - 2)];
 static lv_color_t s_memory_canvas_buffer[(SMALL_CARD_WIDTH - 2) * (SMALL_CARD_HEIGHT - 2)];
 static lv_color_t s_temperature_canvas_buffer[(SMALL_CARD_WIDTH - 2) * (SMALL_CARD_HEIGHT - 2)];
@@ -297,7 +310,7 @@ static int32_t liquid_surface(const liquid_card_t *liquid, int32_t x,
     return surface;
 }
 
-static void render_liquid_wave(liquid_card_t *liquid)
+static bool render_liquid_wave(liquid_card_t *liquid)
 {
     static const int8_t wave_y[LIQUID_WAVE_PERIOD] = {
          0,  1,  2,  2,  3,  4,  4,  5,
@@ -344,7 +357,9 @@ static void render_liquid_wave(liquid_card_t *liquid)
         area.y1 += first_changed_y;
         area.y2 = area.y1 + last_changed_y - first_changed_y;
         lv_obj_invalidate_area(liquid->canvas, &area);
+        return true;
     }
+    return false;
 }
 
 static void liquid_level_anim_cb(void *context, int32_t percent)
@@ -385,12 +400,18 @@ static void set_liquid_level(liquid_card_t *liquid, int32_t target)
 static void liquid_wave_anim_cb(void *context, int32_t phase)
 {
     (void)context;
-    phase %= LIQUID_WAVE_PERIOD;
-    if (phase == s_liquid_wave_phase) return;
-    s_liquid_wave_phase = phase;
-    /* The opaque high-traffic page covers these cards, so avoid rendering
-     * hidden background animations while it is visible. */
-    if (s_traffic_alert && !lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN)) return;
+    /* Keep wave travel time independent from how often the cards are drawn. */
+    s_liquid_wave_phase = phase % LIQUID_WAVE_PERIOD;
+}
+
+void status_dashboard_animate_frame(void)
+{
+    board_display_lock();
+    /* The traffic page is opaque. Never render hidden liquid cards. */
+    if (s_traffic_alert && !lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN)) {
+        board_display_unlock();
+        return;
+    }
     liquid_card_t *cards[] = {
         &s_cpu_liquid,
         &s_memory_liquid,
@@ -398,10 +419,13 @@ static void liquid_wave_anim_cb(void *context, int32_t phase)
         &s_download_liquid,
         &s_upload_liquid,
     };
-    /* Update one card per phase.  Each card still advances about six times
-     * per second, but LVGL never has to flush all five canvas areas at once. */
-    render_liquid_wave(cards[s_liquid_render_slot]);
+    /* Update one card per display task iteration. At 60 Hz each card gets
+     * about 12 opportunities per second, without simultaneous canvas flushes. */
+    if (render_liquid_wave(cards[s_liquid_render_slot])) {
+        s_liquid_updates[s_liquid_render_slot]++;
+    }
     s_liquid_render_slot = (s_liquid_render_slot + 1) % 5;
+    board_display_unlock();
 }
 
 static void start_liquid_wave_animation(void)

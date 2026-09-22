@@ -1,5 +1,6 @@
 #include "board_display.h"
 
+#include <stdatomic.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
@@ -37,10 +38,15 @@ static lv_disp_drv_t s_disp_drv;
 static DMA_ATTR lv_color_t s_buffer_1[LCD_H_RES * LCD_DRAW_LINES];
 static DMA_ATTR lv_color_t s_buffer_2[LCD_H_RES * LCD_DRAW_LINES];
 static SemaphoreHandle_t s_lvgl_lock;
+static atomic_uint s_refreshes;
+static atomic_uint s_flushes;
+static atomic_uint s_dma_completed;
+static atomic_uint s_pixels;
 
 static bool flush_ready(esp_lcd_panel_io_handle_t io,
                         esp_lcd_panel_io_event_data_t *event, void *ctx)
 {
+    atomic_fetch_add_explicit(&s_dma_completed, 1, memory_order_relaxed);
     lv_disp_flush_ready((lv_disp_drv_t *)ctx);
     return false;
 }
@@ -49,11 +55,29 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *pixe
 {
     esp_err_t err = esp_lcd_panel_draw_bitmap(drv->user_data, area->x1, area->y1,
                                                area->x2 + 1, area->y2 + 1, pixels);
-    if (err != ESP_OK) {
+    if (err == ESP_OK) {
+        atomic_fetch_add_explicit(&s_flushes, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_pixels,
+                                  (uint32_t)(area->x2 - area->x1 + 1) *
+                                  (uint32_t)(area->y2 - area->y1 + 1),
+                                  memory_order_relaxed);
+        if (lv_disp_flush_is_last(drv)) {
+            atomic_fetch_add_explicit(&s_refreshes, 1, memory_order_relaxed);
+        }
+    } else {
         ESP_LOGE(TAG, "LCD flush failed: %s", esp_err_to_name(err));
         /* No completion callback follows a rejected transfer. */
         lv_disp_flush_ready(drv);
     }
+}
+
+void board_display_take_perf(board_display_perf_t *perf)
+{
+    if (!perf) return;
+    perf->refreshes = atomic_exchange_explicit(&s_refreshes, 0, memory_order_relaxed);
+    perf->flushes = atomic_exchange_explicit(&s_flushes, 0, memory_order_relaxed);
+    perf->dma_completed = atomic_exchange_explicit(&s_dma_completed, 0, memory_order_relaxed);
+    perf->pixels = atomic_exchange_explicit(&s_pixels, 0, memory_order_relaxed);
 }
 
 static void flush_wait_cb(lv_disp_drv_t *drv)
