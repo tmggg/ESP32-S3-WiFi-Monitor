@@ -11,7 +11,7 @@
 #include "openwrt_status.h"
 
 #define HIGH_TRAFFIC_THRESHOLD_BPS (10ULL * 1024ULL * 1024ULL)
-#define FULLSCREEN_TRAFFIC_ENABLED 1
+#define FULLSCREEN_TRAFFIC_ENABLED 0 /* Keep manual BOOT waveform switching. */
 #define DOWNLOAD_FULL_SCALE_BPS (250ULL * 1024ULL * 1024ULL)
 #define UPLOAD_FULL_SCALE_BPS (10ULL * 1024ULL * 1024ULL)
 #define TRAFFIC_HISTORY_SECONDS 120
@@ -30,6 +30,7 @@
 #define DEFAULT_INTERFACE_ROTATION_US (10LL * 1000LL * 1000LL)
 
 static lv_obj_t *s_connection;
+static lv_obj_t *s_lock_dot;
 static lv_obj_t *s_title;
 static lv_obj_t *s_cpu;
 static lv_obj_t *s_memory;
@@ -65,6 +66,11 @@ static int8_t s_wan_history_slot = -1;
 static uint8_t s_default_interface_index;
 static int64_t s_default_interface_switch_us;
 static atomic_bool s_page_toggle_requested;
+static atomic_bool s_interface_lock_toggle_requested;
+static atomic_bool s_traffic_page_visible;
+static bool s_default_interface_locked;
+static char s_current_default_interface_name[OPENWRT_INTERFACE_NAME_LEN];
+static char s_locked_interface_name[OPENWRT_INTERFACE_NAME_LEN];
 static uint32_t s_x_window_seconds = TRAFFIC_DEFAULT_WINDOW_SECONDS;
 static int32_t s_liquid_wave_phase;
 static uint8_t s_liquid_render_slot;
@@ -124,11 +130,37 @@ static void set_label_if_changed(lv_obj_t *label, const char *text)
     if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
 }
 
+static void update_lock_indicator(void)
+{
+    if (!s_lock_dot) return;
+    bool show = s_default_interface_locked && s_current_default_interface_name[0] &&
+                !atomic_load(&s_traffic_page_visible);
+    if (!show) {
+        if (!lv_obj_has_flag(s_lock_dot, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_lock_dot, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    lv_obj_update_layout(s_connection);
+    lv_area_t label_area;
+    lv_obj_get_coords(s_connection, &label_area);
+    int16_t dot_x = label_area.x1 - 10;
+    int16_t dot_y = label_area.y1 + 5;
+    if (lv_obj_get_x(s_lock_dot) != dot_x || lv_obj_get_y(s_lock_dot) != dot_y) {
+        lv_obj_set_pos(s_lock_dot, dot_x, dot_y);
+    }
+    if (lv_obj_has_flag(s_lock_dot, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_clear_flag(s_lock_dot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void set_traffic_page_visible(bool visible)
 {
     bool hidden = lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
     if (visible && hidden) lv_obj_clear_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
     else if (!visible && !hidden) lv_obj_add_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN);
+    atomic_store(&s_traffic_page_visible, visible);
+    update_lock_indicator();
 }
 
 static void animate_waveform_redraw(void *context, int32_t visible_points)
@@ -212,11 +244,39 @@ void status_dashboard_request_page_toggle(void)
     atomic_store(&s_page_toggle_requested, true);
 }
 
+void status_dashboard_request_interface_lock_toggle(void)
+{
+    atomic_store(&s_interface_lock_toggle_requested, true);
+}
+
+bool status_dashboard_is_default_page(void)
+{
+    return !atomic_load(&s_traffic_page_visible);
+}
+
 bool status_dashboard_process_ui_requests(void)
 {
-    if (!atomic_exchange(&s_page_toggle_requested, false)) return false;
+    bool page_requested = atomic_exchange(&s_page_toggle_requested, false);
+    bool lock_requested = atomic_exchange(&s_interface_lock_toggle_requested, false);
+    if (!page_requested && !lock_requested) return false;
 
     board_display_lock();
+    if (lock_requested && !atomic_load(&s_traffic_page_visible)) {
+        if (s_default_interface_locked) {
+            s_default_interface_locked = false;
+            s_locked_interface_name[0] = '\0';
+            s_default_interface_switch_us = esp_timer_get_time();
+        } else if (s_current_default_interface_name[0]) {
+            strlcpy(s_locked_interface_name, s_current_default_interface_name,
+                    sizeof(s_locked_interface_name));
+            s_default_interface_locked = true;
+        }
+        update_lock_indicator();
+    }
+    if (!page_requested) {
+        board_display_unlock();
+        return true;
+    }
     int next_slot = -1;
     for (int i = s_manual_history_slot + 1; i < OPENWRT_MAX_INTERFACES; ++i) {
         if (s_interface_histories[i].active) {
@@ -513,6 +573,15 @@ esp_err_t status_dashboard_init(void)
     lv_obj_set_style_text_color(s_connection, lv_color_hex(0xFFB84D), 0);
     lv_obj_align(s_connection, LV_ALIGN_TOP_RIGHT, -7, 6);
 
+    s_lock_dot = lv_obj_create(screen);
+    lv_obj_set_size(s_lock_dot, 6, 6);
+    lv_obj_set_style_radius(s_lock_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(s_lock_dot, 0, 0);
+    lv_obj_set_style_pad_all(s_lock_dot, 0, 0);
+    lv_obj_set_style_bg_color(s_lock_dot, lv_color_hex(0xFF3B3B), 0);
+    lv_obj_clear_flag(s_lock_dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_lock_dot, LV_OBJ_FLAG_HIDDEN);
+
     make_liquid_card(screen, &s_cpu_liquid, s_cpu_canvas_buffer,
                      2, 28, SMALL_CARD_WIDTH, SMALL_CARD_HEIGHT, "CPU",
                      lv_color_hex(0xA8E66A), lv_color_hex(0x527A2A),
@@ -761,7 +830,22 @@ static int32_t rate_level(uint64_t bytes_per_second, uint64_t full_scale_bps)
 static const openwrt_interface_status_t *default_page_interface(
     const openwrt_status_t *status)
 {
-    if (status->interface_count == 0) return NULL;
+    if (status->interface_count == 0) {
+        s_current_default_interface_name[0] = '\0';
+        return NULL;
+    }
+    if (s_default_interface_locked) {
+        for (uint8_t i = 0; i < status->interface_count; ++i) {
+            if (strcmp(status->interfaces[i].name, s_locked_interface_name) == 0) {
+                s_default_interface_index = i;
+                strlcpy(s_current_default_interface_name, status->interfaces[i].name,
+                        sizeof(s_current_default_interface_name));
+                return &status->interfaces[i];
+            }
+        }
+        s_current_default_interface_name[0] = '\0';
+        return NULL;
+    }
     if (s_default_interface_index >= status->interface_count) {
         s_default_interface_index = 0;
         s_default_interface_switch_us = esp_timer_get_time();
@@ -772,7 +856,10 @@ static const openwrt_interface_status_t *default_page_interface(
         s_default_interface_index = (s_default_interface_index + 1) % status->interface_count;
         s_default_interface_switch_us = now;
     }
-    return &status->interfaces[s_default_interface_index];
+    const openwrt_interface_status_t *selected = &status->interfaces[s_default_interface_index];
+    strlcpy(s_current_default_interface_name, selected->name,
+            sizeof(s_current_default_interface_name));
+    return selected;
 }
 
 static int find_history_slot(const char *name, bool create)
@@ -837,6 +924,8 @@ void status_dashboard_update(void)
 
     board_display_lock();
     if (!status.valid) {
+        s_current_default_interface_name[0] = '\0';
+        update_lock_indicator();
         lv_anim_del(&s_redraw_animation, NULL);
         if (s_manual_history_slot >= 0) {
             lv_label_set_text(s_traffic_alert_title,
@@ -858,6 +947,7 @@ void status_dashboard_update(void)
 
     const openwrt_interface_status_t *default_interface = default_page_interface(&status);
     set_label_if_changed(s_connection, default_interface ? default_interface->name : "NO IFACE");
+    update_lock_indicator();
     set_label_if_changed(s_title, status.hostname[0] ? status.hostname : "OpenWrt");
     lv_obj_set_style_text_color(s_connection, lv_color_hex(0x44D7B6), 0);
     format_tenths(status.cpu_percent, "%", text, sizeof(text));

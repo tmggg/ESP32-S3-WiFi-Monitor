@@ -7,6 +7,8 @@
 esp_err_t status_dashboard_init(void);
 void status_dashboard_update(void);
 void status_dashboard_request_page_toggle(void);
+void status_dashboard_request_interface_lock_toggle(void);
+bool status_dashboard_is_default_page(void);
 bool status_dashboard_process_ui_requests(void);
 void status_dashboard_animate_frame(void);
 
