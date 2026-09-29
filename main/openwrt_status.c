@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "cJSON.h"
+#include "cpu_load_led.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -33,6 +34,7 @@ static void set_message(const char *message)
     s_status.valid = false;
     strlcpy(s_status.message, message, sizeof(s_status.message));
     xSemaphoreGive(s_lock);
+    cpu_load_led_set_unavailable();
 }
 
 static esp_err_t http_event(esp_http_client_event_t *event)
@@ -79,6 +81,7 @@ static esp_err_t fetch_status(void)
     char encoded_token[385];
     if (!wifi_manager_get_monitor_ip(gateway, sizeof(gateway)) &&
         !wifi_manager_get_gateway(gateway, sizeof(gateway))) {
+        set_message("Gateway unavailable");
         return ESP_ERR_INVALID_STATE;
     }
     if (!wifi_manager_get_status_token(token, sizeof(token)) || token[0] == 0) {
@@ -100,7 +103,10 @@ static esp_err_t fetch_status(void)
         .buffer_size_tx = 512,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return ESP_ERR_NO_MEM;
+    if (!client) {
+        set_message("Gateway unavailable");
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t err = esp_http_client_perform(client);
     int status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
@@ -186,6 +192,7 @@ static esp_err_t fetch_status(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_status = next;
     xSemaphoreGive(s_lock);
+    cpu_load_led_set_openwrt_load(next.cpu_percent);
     return ESP_OK;
 }
 
