@@ -1,5 +1,7 @@
 #include "boot_button.h"
+#include <string.h>
 #include "board_display.h"
+#include "clock_screensaver.h"
 #include "cpu_load_led.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -19,6 +21,50 @@ static const char *TAG = "main";
 #define NETWORK_CORE 0
 #define DISPLAY_CORE 1
 
+typedef enum {
+    SCREENSAVER_NONE,
+    SCREENSAVER_GIF,
+    SCREENSAVER_CLOCK,
+} screensaver_kind_t;
+
+static screensaver_kind_t configured_screensaver(const openwrt_status_t *status)
+{
+    if (!status || status->screensaver_timeout == 0) return SCREENSAVER_NONE;
+    if (strcmp(status->screensaver_type, "gif") == 0) return SCREENSAVER_GIF;
+    if (strcmp(status->screensaver_type, "clock") == 0) return SCREENSAVER_CLOCK;
+    return SCREENSAVER_NONE;
+}
+
+static esp_err_t set_screensaver(screensaver_kind_t desired,
+                                 screensaver_kind_t *active)
+{
+    if (!active || desired == *active) return ESP_OK;
+
+    if (*active != SCREENSAVER_NONE) {
+        board_display_lock();
+        if (*active == SCREENSAVER_GIF) test_gif_hide();
+        else if (*active == SCREENSAVER_CLOCK) clock_screensaver_hide();
+        board_display_unlock();
+        status_dashboard_set_render_paused(false);
+        *active = SCREENSAVER_NONE;
+        status_dashboard_update();
+    }
+    if (desired == SCREENSAVER_NONE) return ESP_OK;
+
+    esp_err_t error = ESP_OK;
+    board_display_lock();
+    if (desired == SCREENSAVER_GIF) error = test_gif_show();
+    else clock_screensaver_show();
+    board_display_unlock();
+    if (error != ESP_OK) return error;
+
+    *active = desired;
+    status_dashboard_set_render_paused(true);
+    ESP_LOGI(TAG, "%s screensaver started",
+             desired == SCREENSAVER_GIF ? "GIF" : "Clock");
+    return ESP_OK;
+}
+
 static void display_task(void *arg)
 {
     (void)arg;
@@ -32,36 +78,44 @@ static void display_task(void *arg)
     uint32_t handler_calls = 0;
     uint32_t handler_over_budget = 0;
     bool display_dimmed = false;
+    screensaver_kind_t active_screensaver = SCREENSAVER_NONE;
+    TickType_t screensaver_retry_at = 0;
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
         if (!display_dimmed && now - display_started >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS)) {
             board_display_set_brightness(25);
             display_dimmed = true;
-            board_display_lock();
-            esp_err_t gif_err = test_gif_show();
-            board_display_unlock();
-            if (gif_err == ESP_OK) {
-                status_dashboard_set_render_paused(true);
-                ESP_LOGI(TAG, "Display idle: brightness reduced to 25%%; screensaver started");
-            } else {
-                ESP_LOGE(TAG, "Display idle: brightness reduced to 25%%; screensaver failed: %s",
-                         esp_err_to_name(gif_err));
-            }
+            ESP_LOGI(TAG, "Display idle: brightness reduced to 25%%");
         }
         if (now - last_update >= pdMS_TO_TICKS(500)) {
+            static openwrt_status_t status;
+            memset(&status, 0, sizeof(status));
+            openwrt_status_get(&status);
+            clock_screensaver_update(&status);
             status_dashboard_update();
             last_update = now;
+
+            screensaver_kind_t desired = SCREENSAVER_NONE;
+            if (status.screensaver_timeout > 0) {
+                uint64_t elapsed_ms = (uint64_t)(now - display_started) * portTICK_PERIOD_MS;
+                uint64_t timeout_ms = (uint64_t)status.screensaver_timeout * 1000ULL;
+                if (elapsed_ms >= timeout_ms) desired = configured_screensaver(&status);
+            }
+            if (desired != active_screensaver &&
+                (desired == SCREENSAVER_NONE || now >= screensaver_retry_at)) {
+                esp_err_t screen_error = set_screensaver(desired, &active_screensaver);
+                if (screen_error != ESP_OK) {
+                    ESP_LOGE(TAG, "Unable to start configured screensaver: %s",
+                             esp_err_to_name(screen_error));
+                    screensaver_retry_at = now + pdMS_TO_TICKS(1000);
+                }
+            }
         }
         if (status_dashboard_process_ui_requests()) {
-            bool screensaver_dismissed = false;
-            if (test_gif_is_visible()) {
-                board_display_lock();
-                test_gif_hide();
-                board_display_unlock();
-                status_dashboard_set_render_paused(false);
-                status_dashboard_update();
-                screensaver_dismissed = true;
+            bool screensaver_dismissed = active_screensaver != SCREENSAVER_NONE;
+            if (screensaver_dismissed) {
+                set_screensaver(SCREENSAVER_NONE, &active_screensaver);
                 ESP_LOGI(TAG, "Screensaver dismissed; dashboard resumed");
             }
             board_display_set_brightness(50);
@@ -129,6 +183,7 @@ void app_main(void)
     ESP_ERROR_CHECK(board_display_init());
     ESP_ERROR_CHECK(cpu_load_led_start());
     ESP_ERROR_CHECK(status_dashboard_init());
+    ESP_ERROR_CHECK(clock_screensaver_init());
     ESP_ERROR_CHECK(test_gif_preload_start());
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(openwrt_status_start());

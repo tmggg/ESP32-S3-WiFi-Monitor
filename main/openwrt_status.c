@@ -187,6 +187,24 @@ static esp_err_t fetch_status(void)
     }
     cJSON *hostname = cJSON_GetObjectItemCaseSensitive(root, "hostname");
     if (cJSON_IsString(hostname)) strlcpy(next.hostname, hostname->valuestring, sizeof(next.hostname));
+    cJSON *system_date = cJSON_GetObjectItemCaseSensitive(root, "system_date");
+    if (cJSON_IsString(system_date)) {
+        strlcpy(next.system_date, system_date->valuestring, sizeof(next.system_date));
+    }
+    cJSON *system_time = cJSON_GetObjectItemCaseSensitive(root, "system_time");
+    if (cJSON_IsString(system_time)) {
+        strlcpy(next.system_time, system_time->valuestring, sizeof(next.system_time));
+    }
+    cJSON *screensaver_timeout = cJSON_GetObjectItemCaseSensitive(root, "screensaver_timeout");
+    if (cJSON_IsNumber(screensaver_timeout) && screensaver_timeout->valuedouble > 0) {
+        double timeout = screensaver_timeout->valuedouble;
+        next.screensaver_timeout = timeout > UINT32_MAX ? UINT32_MAX : (uint32_t)timeout;
+    }
+    cJSON *screensaver_type = cJSON_GetObjectItemCaseSensitive(root, "screensaver_type");
+    if (cJSON_IsString(screensaver_type)) {
+        strlcpy(next.screensaver_type, screensaver_type->valuestring,
+                sizeof(next.screensaver_type));
+    }
     cJSON_Delete(root);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);

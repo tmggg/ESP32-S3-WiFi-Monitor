@@ -29,6 +29,10 @@ typedef struct {
     uint64_t download_bytes;
     uint64_t upload_bytes;
     char hostname[64];
+    char system_date[16];
+    char system_time[16];
+    uint32_t screensaver_timeout;
+    char screensaver_type[16];
     char wan_device[24];
     char message[48];
     uint8_t interface_count;

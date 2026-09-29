@@ -10,5 +10,7 @@ Compatibility requirements:
 - Global color table
 - No more than 60 frames for full PSRAM predecode
 
-At startup the firmware decodes the frames to RGB565 in PSRAM. After 60 seconds
-without button activity, the display dims and starts the screensaver.
+At startup the firmware decodes the frames to RGB565 in PSRAM. The OpenWrt
+response selects the idle screen with `screensaver_type` (`gif` or `clock`) and
+sets its delay in seconds with `screensaver_timeout`. A timeout of `0` disables
+both screensavers. Backlight dimming remains on its independent 60-second timer.
