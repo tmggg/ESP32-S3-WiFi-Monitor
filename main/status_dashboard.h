@@ -11,6 +11,7 @@ void status_dashboard_request_interface_lock_toggle(void);
 bool status_dashboard_is_default_page(void);
 bool status_dashboard_process_ui_requests(void);
 void status_dashboard_animate_frame(void);
+void status_dashboard_set_render_paused(bool paused);
 
 typedef struct {
     bool traffic_page_visible;

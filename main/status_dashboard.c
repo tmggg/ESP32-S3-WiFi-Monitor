@@ -68,6 +68,7 @@ static int64_t s_default_interface_switch_us;
 static atomic_bool s_page_toggle_requested;
 static atomic_bool s_interface_lock_toggle_requested;
 static atomic_bool s_traffic_page_visible;
+static atomic_bool s_render_paused;
 static bool s_default_interface_locked;
 static char s_current_default_interface_name[OPENWRT_INTERFACE_NAME_LEN];
 static char s_locked_interface_name[OPENWRT_INTERFACE_NAME_LEN];
@@ -254,11 +255,20 @@ bool status_dashboard_is_default_page(void)
     return !atomic_load(&s_traffic_page_visible);
 }
 
+void status_dashboard_set_render_paused(bool paused)
+{
+    atomic_store(&s_render_paused, paused);
+}
+
 bool status_dashboard_process_ui_requests(void)
 {
     bool page_requested = atomic_exchange(&s_page_toggle_requested, false);
     bool lock_requested = atomic_exchange(&s_interface_lock_toggle_requested, false);
     if (!page_requested && !lock_requested) return false;
+
+    /* While the screensaver covers the dashboard, consume the first button
+     * action only as a wake request. main.c will hide the GIF and resume us. */
+    if (atomic_load(&s_render_paused)) return true;
 
     board_display_lock();
     if (lock_requested && !atomic_load(&s_traffic_page_visible)) {
@@ -466,6 +476,7 @@ static void liquid_wave_anim_cb(void *context, int32_t phase)
 
 void status_dashboard_animate_frame(void)
 {
+    if (atomic_load(&s_render_paused)) return;
     board_display_lock();
     /* The traffic page is opaque. Never render hidden liquid cards. */
     if (s_traffic_alert && !lv_obj_has_flag(s_traffic_alert, LV_OBJ_FLAG_HIDDEN)) {
@@ -917,6 +928,7 @@ static bool append_traffic_samples(const openwrt_status_t *status)
 
 void status_dashboard_update(void)
 {
+    if (atomic_load(&s_render_paused)) return;
     static openwrt_status_t status;
     memset(&status, 0, sizeof(status));
     openwrt_status_get(&status);

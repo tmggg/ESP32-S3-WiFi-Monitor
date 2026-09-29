@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 #include "openwrt_status.h"
 #include "status_dashboard.h"
+#include "test_gif.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "main";
@@ -37,17 +38,37 @@ static void display_task(void *arg)
         if (!display_dimmed && now - display_started >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS)) {
             board_display_set_brightness(25);
             display_dimmed = true;
-            ESP_LOGI(TAG, "Display brightness reduced to 25%%");
+            board_display_lock();
+            esp_err_t gif_err = test_gif_show();
+            board_display_unlock();
+            if (gif_err == ESP_OK) {
+                status_dashboard_set_render_paused(true);
+                ESP_LOGI(TAG, "Display idle: brightness reduced to 25%%; screensaver started");
+            } else {
+                ESP_LOGE(TAG, "Display idle: brightness reduced to 25%%; screensaver failed: %s",
+                         esp_err_to_name(gif_err));
+            }
         }
         if (now - last_update >= pdMS_TO_TICKS(500)) {
             status_dashboard_update();
             last_update = now;
         }
         if (status_dashboard_process_ui_requests()) {
+            bool screensaver_dismissed = false;
+            if (test_gif_is_visible()) {
+                board_display_lock();
+                test_gif_hide();
+                board_display_unlock();
+                status_dashboard_set_render_paused(false);
+                status_dashboard_update();
+                screensaver_dismissed = true;
+                ESP_LOGI(TAG, "Screensaver dismissed; dashboard resumed");
+            }
             board_display_set_brightness(50);
             display_started = now;
             display_dimmed = false;
-            ESP_LOGI(TAG, "Manual page switch: brightness set to 50%%; dim timer reset");
+            ESP_LOGI(TAG, "%s: brightness set to 50%%; dim timer reset",
+                     screensaver_dismissed ? "User activity" : "Manual page switch");
         }
         int64_t handler_started = esp_timer_get_time();
         status_dashboard_animate_frame();
@@ -108,6 +129,7 @@ void app_main(void)
     ESP_ERROR_CHECK(board_display_init());
     ESP_ERROR_CHECK(cpu_load_led_start());
     ESP_ERROR_CHECK(status_dashboard_init());
+    ESP_ERROR_CHECK(test_gif_preload_start());
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(openwrt_status_start());
     BaseType_t display_created = xTaskCreatePinnedToCore(
