@@ -1,6 +1,7 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x300000,
-# About 80% of the flash left after the factory app; raw storage, not mounted.
-storage,  data,  0x40,    0x310000, 0xA50000,
+# 8 MiB application partition: 50% of the 16 MiB flash.
+factory,  app,  factory, 0x10000, 0x800000,
+# 0x666000 bytes: approximately 40% of the flash, aligned to 4 KiB.
+storage,  data,  0x40,    0x810000, 0x666000,
