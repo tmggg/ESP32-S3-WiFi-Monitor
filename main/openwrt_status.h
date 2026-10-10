@@ -33,6 +33,9 @@ typedef struct {
     char system_time[16];
     uint32_t screensaver_timeout;
     char screensaver_type[16];
+    char gif_url[256];
+    char gif_version[65];
+    uint32_t gif_size;
     char wan_device[24];
     char message[48];
     uint8_t interface_count;

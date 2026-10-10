@@ -30,7 +30,9 @@ typedef enum {
 static screensaver_kind_t configured_screensaver(const openwrt_status_t *status)
 {
     if (!status || status->screensaver_timeout == 0) return SCREENSAVER_NONE;
-    if (strcmp(status->screensaver_type, "gif") == 0) return SCREENSAVER_GIF;
+    if (strcmp(status->screensaver_type, "gif") == 0) {
+        return test_gif_is_ready() ? SCREENSAVER_GIF : SCREENSAVER_CLOCK;
+    }
     if (strcmp(status->screensaver_type, "clock") == 0) return SCREENSAVER_CLOCK;
     return SCREENSAVER_NONE;
 }
@@ -92,6 +94,11 @@ static void display_task(void *arg)
             static openwrt_status_t status;
             memset(&status, 0, sizeof(status));
             openwrt_status_get(&status);
+            esp_err_t gif_config_error = test_gif_configure(&status);
+            if (gif_config_error != ESP_OK && gif_config_error != ESP_ERR_INVALID_ARG) {
+                ESP_LOGD(TAG, "GIF preparation state: %s",
+                         esp_err_to_name(gif_config_error));
+            }
             clock_screensaver_update(&status);
             status_dashboard_update();
             last_update = now;
@@ -168,7 +175,16 @@ static void display_task(void *arg)
         TickType_t frame_ticks = frame_tick_remainder / 60;
         frame_tick_remainder %= 60;
         if (frame_ticks == 0) frame_ticks = 1;
-        xTaskDelayUntil(&last_frame_wake, frame_ticks);
+        TickType_t current_tick = xTaskGetTickCount();
+        if ((int32_t)(current_tick - last_frame_wake) >= (int32_t)frame_ticks) {
+            /* A full-screen GIF frame can exceed the target interval. Drop
+             * the missed schedule instead of starving CPU1's IDLE task while
+             * trying to catch up with obsolete frames. */
+            last_frame_wake = current_tick;
+            vTaskDelay(1);
+        } else {
+            xTaskDelayUntil(&last_frame_wake, frame_ticks);
+        }
     }
 }
 
@@ -184,7 +200,6 @@ void app_main(void)
     ESP_ERROR_CHECK(cpu_load_led_start());
     ESP_ERROR_CHECK(status_dashboard_init());
     ESP_ERROR_CHECK(clock_screensaver_init());
-    ESP_ERROR_CHECK(test_gif_preload_start());
     ESP_ERROR_CHECK(wifi_manager_init());
     ESP_ERROR_CHECK(openwrt_status_start());
     BaseType_t display_created = xTaskCreatePinnedToCore(
