@@ -6,9 +6,18 @@
 
 #define OPENWRT_MAX_INTERFACES 16
 #define OPENWRT_INTERFACE_NAME_LEN 24
+/* Reserved sentinel: invalid or absent traffic fields are never real zeroes. */
+#define OPENWRT_TRAFFIC_UNAVAILABLE UINT64_MAX
+#define OPENWRT_TRAFFIC_MAX_JSON_INTEGER 9007199254740991ULL
+#define OPENWRT_STALE_AFTER_MS 3000ULL
+#define OPENWRT_IDENTITY_LEN 65
 
 typedef struct {
     char name[OPENWRT_INTERFACE_NAME_LEN];
+    uint64_t ifindex;
+    uint64_t interval_ms;
+    bool download_bytes_valid;
+    bool upload_bytes_valid;
     uint64_t download_bps;
     uint64_t upload_bps;
     uint64_t download_bytes;
@@ -17,7 +26,19 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    uint32_t sample_id;
+    uint64_t sample_id;
+    uint64_t history_generation;
+    bool protocol_v2;
+    bool stale;
+    char boot_id[OPENWRT_IDENTITY_LEN];
+    char collector_id[OPENWRT_IDENTITY_LEN];
+    uint64_t sample_seq;
+    uint64_t sample_end_ms;
+    uint64_t interval_ms;
+    uint64_t age_ms;
+    int64_t sample_local_us;
+    int64_t request_started_us;
+    int64_t received_us;
     float cpu_percent;
     float memory_percent;
     float temperature_c;

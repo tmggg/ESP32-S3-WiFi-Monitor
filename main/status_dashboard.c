@@ -1,6 +1,7 @@
 #include "status_dashboard.h"
 
 #include <stdatomic.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "board_display.h"
@@ -9,12 +10,12 @@
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "openwrt_status.h"
+#include "traffic_history.h"
 
-#define HIGH_TRAFFIC_THRESHOLD_BPS (10ULL * 1024ULL * 1024ULL)
+#define HIGH_TRAFFIC_THRESHOLD_BPS (10ULL * 1000ULL * 1000ULL)
 #define FULLSCREEN_TRAFFIC_ENABLED 0 /* Keep manual BOOT waveform switching. */
-#define DOWNLOAD_FULL_SCALE_BPS (250ULL * 1024ULL * 1024ULL)
-#define UPLOAD_FULL_SCALE_BPS (10ULL * 1024ULL * 1024ULL)
-#define TRAFFIC_HISTORY_SECONDS 120
+#define DOWNLOAD_FULL_SCALE_BPS (10ULL * 1000ULL * 1000ULL)
+#define UPLOAD_FULL_SCALE_BPS (10ULL * 1000ULL * 1000ULL)
 #define TRAFFIC_DEFAULT_WINDOW_SECONDS 10
 #define X_AXIS_MAJOR_TICKS 7
 #define CHART_ANIMATION_MS 650
@@ -48,17 +49,14 @@ static lv_obj_t *s_traffic_alert_stats;
 static lv_obj_t *s_traffic_chart;
 static lv_chart_series_t *s_download_series;
 static lv_chart_series_t *s_upload_series;
-typedef struct {
-    bool active;
-    char name[OPENWRT_INTERFACE_NAME_LEN];
-    uint32_t download[TRAFFIC_HISTORY_SECONDS];
-    uint32_t upload[TRAFFIC_HISTORY_SECONDS];
-    uint32_t index;
-    uint32_t count;
-} traffic_history_t;
 
 static traffic_history_t *s_interface_histories;
-static uint32_t s_last_sample_id;
+static uint64_t s_last_sample_id;
+static uint64_t s_history_generation;
+static int64_t s_last_redraw_second = -1;
+static uint64_t s_chart_scale_bps = 750000;
+static int64_t s_chart_scale_changed_us;
+static int8_t s_chart_history_slot = -1;
 static bool s_was_high_traffic;
 static int8_t s_manual_history_slot = -1;
 static int8_t s_visible_history_slot = -1;
@@ -66,6 +64,7 @@ static int8_t s_wan_history_slot = -1;
 static uint8_t s_default_interface_index;
 static int64_t s_default_interface_switch_us;
 static atomic_bool s_page_toggle_requested;
+static atomic_bool s_wake_requested;
 static atomic_bool s_interface_lock_toggle_requested;
 static atomic_bool s_traffic_page_visible;
 static atomic_bool s_render_paused;
@@ -120,8 +119,9 @@ static lv_color_t s_upload_canvas_buffer[(WAN_CARD_WIDTH - 2) * (WAN_CARD_HEIGHT
 typedef struct {
     uint16_t point_count;
     uint16_t revealed;
-    lv_coord_t download[TRAFFIC_HISTORY_SECONDS];
-    lv_coord_t upload[TRAFFIC_HISTORY_SECONDS];
+    lv_coord_t download[TRAFFIC_HISTORY_CAPACITY];
+    lv_coord_t upload[TRAFFIC_HISTORY_CAPACITY];
+    int64_t sample_end_us[TRAFFIC_HISTORY_CAPACITY];
 } chart_redraw_animation_t;
 
 static chart_redraw_animation_t s_redraw_animation;
@@ -181,60 +181,81 @@ static void start_waveform_redraw(int history_slot, bool animate)
 {
     if (history_slot < 0 || history_slot >= OPENWRT_MAX_INTERFACES) return;
     traffic_history_t *history = &s_interface_histories[history_slot];
+    int64_t now_us = esp_timer_get_time();
+    uint32_t window = TRAFFIC_DEFAULT_WINDOW_SECONDS;
+    uint64_t peak = 0;
+    for (uint32_t i = 0; i < TRAFFIC_HISTORY_CAPACITY; ++i) {
+        const traffic_sample_t *sample = &history->samples[i];
+        if (!traffic_sample_in_window(sample, now_us)) continue;
+        uint64_t age = now_us / TRAFFIC_SECOND_US - traffic_sample_first_second(sample);
+        if (age > TRAFFIC_HISTORY_SECONDS) age = TRAFFIC_HISTORY_SECONDS;
+        if (age > window) window = (uint32_t)age;
+        if (sample->download != OPENWRT_TRAFFIC_UNAVAILABLE && sample->download > peak)
+            peak = sample->download;
+        if (sample->upload != OPENWRT_TRAFFIC_UNAVAILABLE && sample->upload > peak)
+            peak = sample->upload;
+    }
+    if (window > TRAFFIC_HISTORY_SECONDS) window = TRAFFIC_HISTORY_SECONDS;
+    uint64_t desired_scale = traffic_chart_scale(peak);
+    if (s_chart_history_slot != history_slot || desired_scale > s_chart_scale_bps) {
+        s_chart_scale_bps = desired_scale;
+        s_chart_scale_changed_us = now_us;
+    } else if (desired_scale < s_chart_scale_bps * 7 / 10 &&
+               now_us - s_chart_scale_changed_us >= 5 * TRAFFIC_SECOND_US) {
+        s_chart_scale_bps = desired_scale;
+        s_chart_scale_changed_us = now_us;
+    }
+    s_chart_history_slot = history_slot;
     lv_anim_del(&s_redraw_animation, NULL);
-    uint32_t desired_window = history->count > TRAFFIC_DEFAULT_WINDOW_SECONDS ?
-                              history->count : TRAFFIC_DEFAULT_WINDOW_SECONDS;
-    if (desired_window > TRAFFIC_HISTORY_SECONDS) desired_window = TRAFFIC_HISTORY_SECONDS;
-    if (desired_window != s_x_window_seconds) {
-        s_x_window_seconds = desired_window;
-        lv_chart_set_point_count(s_traffic_chart, s_x_window_seconds);
-        lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_PRIMARY_X,
-                           0, s_x_window_seconds);
+    s_x_window_seconds = window;
+    uint32_t points = window + 1; /* Inclusive 0s .. -window seconds. */
+    if (lv_chart_get_point_count(s_traffic_chart) != points)
+        lv_chart_set_point_count(s_traffic_chart, points);
+    lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_PRIMARY_X, 0, window);
+    lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_SECONDARY_Y, 0, CHART_VALUE_LIMIT);
+    for (uint32_t i = 0; i < points; ++i) {
+        s_redraw_animation.download[i] = LV_CHART_POINT_NONE;
+        s_redraw_animation.upload[i] = LV_CHART_POINT_NONE;
+        s_redraw_animation.sample_end_us[i] = 0;
     }
-    if (animate) {
-        lv_chart_set_all_value(s_traffic_chart, s_download_series, LV_CHART_POINT_NONE);
-        lv_chart_set_all_value(s_traffic_chart, s_upload_series, LV_CHART_POINT_NONE);
+    for (uint32_t i = 0; i < TRAFFIC_HISTORY_CAPACITY; ++i) {
+        const traffic_sample_t *sample = &history->samples[i];
+        if (!traffic_sample_in_window(sample, now_us)) continue;
+        int64_t now_second = now_us / TRAFFIC_SECOND_US;
+        int64_t newest_age = now_second - sample->received_us / TRAFFIC_SECOND_US;
+        int64_t oldest_age = now_second - traffic_sample_first_second(sample);
+        if (newest_age >= points) continue;
+        if (oldest_age >= points) oldest_age = points - 1;
+        int32_t down = traffic_chart_coordinate(sample->download, s_chart_scale_bps);
+        int32_t up = traffic_chart_coordinate(sample->upload, s_chart_scale_bps);
+        for (int64_t age = newest_age; age <= oldest_age; ++age) {
+            /* End buckets can overlap after quantization. The newer sample
+             * wins, including unavailable values, independent of ring order. */
+            if (sample->received_us <= s_redraw_animation.sample_end_us[age]) continue;
+            s_redraw_animation.sample_end_us[age] = sample->received_us;
+            s_redraw_animation.download[age] = down < 0 ? LV_CHART_POINT_NONE : down;
+            s_redraw_animation.upload[age] = up < 0 ? LV_CHART_POINT_NONE : up;
+        }
     }
-    s_redraw_animation.point_count = history->count;
+    s_redraw_animation.point_count = points;
     s_redraw_animation.revealed = 0;
-
-    /* The newest sample is always point zero; older samples extend right. */
-    uint32_t peak = 500;
-    for (uint32_t i = 0; i < history->count; ++i) {
-        uint32_t source = (history->index + TRAFFIC_HISTORY_SECONDS - 1 - i) %
-                          TRAFFIC_HISTORY_SECONDS;
-        s_redraw_animation.download[i] = history->download[source] > CHART_VALUE_LIMIT ?
-                                         CHART_VALUE_LIMIT : history->download[source];
-        s_redraw_animation.upload[i] = history->upload[source] > CHART_VALUE_LIMIT ?
-                                       CHART_VALUE_LIMIT : history->upload[source];
-        if (history->download[source] > peak) peak = history->download[source];
-        if (history->upload[source] > peak) peak = history->upload[source];
-    }
-    uint32_t chart_max = peak + peak / 5;
-    if (chart_max > CHART_VALUE_LIMIT) chart_max = CHART_VALUE_LIMIT;
-    lv_chart_set_range(s_traffic_chart, LV_CHART_AXIS_SECONDARY_Y, 0, chart_max);
-
     if (!animate) {
-        /* A new one-second sample shifts the visible history. Update the
-         * series in place and invalidate the chart only once, rather than
-         * scheduling 2 * point_count individual point invalidations. */
         lv_coord_t *download = lv_chart_get_y_array(s_traffic_chart, s_download_series);
         lv_coord_t *upload = lv_chart_get_y_array(s_traffic_chart, s_upload_series);
         if (download && upload) {
-            for (uint32_t i = 0; i < s_x_window_seconds; ++i) {
-                download[i] = i < history->count ? s_redraw_animation.download[i] : LV_CHART_POINT_NONE;
-                upload[i] = i < history->count ? s_redraw_animation.upload[i] : LV_CHART_POINT_NONE;
-            }
+            memcpy(download, s_redraw_animation.download, points * sizeof(*download));
+            memcpy(upload, s_redraw_animation.upload, points * sizeof(*upload));
             lv_chart_refresh(s_traffic_chart);
         }
         return;
     }
-
+    lv_chart_set_all_value(s_traffic_chart, s_download_series, LV_CHART_POINT_NONE);
+    lv_chart_set_all_value(s_traffic_chart, s_upload_series, LV_CHART_POINT_NONE);
     lv_anim_t animation;
     lv_anim_init(&animation);
     lv_anim_set_var(&animation, &s_redraw_animation);
     lv_anim_set_exec_cb(&animation, animate_waveform_redraw);
-    lv_anim_set_values(&animation, 0, history->count);
+    lv_anim_set_values(&animation, 0, points);
     lv_anim_set_time(&animation, CHART_ANIMATION_MS);
     lv_anim_set_path_cb(&animation, lv_anim_path_linear);
     lv_anim_start(&animation);
@@ -248,6 +269,11 @@ void status_dashboard_request_page_toggle(void)
 void status_dashboard_request_interface_lock_toggle(void)
 {
     atomic_store(&s_interface_lock_toggle_requested, true);
+}
+
+void status_dashboard_request_wake(void)
+{
+    atomic_store(&s_wake_requested, true);
 }
 
 bool status_dashboard_is_default_page(void)
@@ -264,11 +290,12 @@ bool status_dashboard_process_ui_requests(void)
 {
     bool page_requested = atomic_exchange(&s_page_toggle_requested, false);
     bool lock_requested = atomic_exchange(&s_interface_lock_toggle_requested, false);
-    if (!page_requested && !lock_requested) return false;
+    bool wake_requested = atomic_exchange(&s_wake_requested, false);
+    if (!page_requested && !lock_requested && !wake_requested) return false;
 
     /* While the screensaver covers the dashboard, consume the first button
      * action only as a wake request. main.c will hide the GIF and resume us. */
-    if (atomic_load(&s_render_paused)) return true;
+    if (atomic_load(&s_render_paused) || board_display_is_off() || wake_requested) return true;
 
     board_display_lock();
     if (lock_requested && !atomic_load(&s_traffic_page_visible)) {
@@ -330,9 +357,10 @@ static void chart_draw_event(lv_event_t *event)
         if (seconds == 0) lv_snprintf(dsc->text, dsc->text_length, "0s");
         else lv_snprintf(dsc->text, dsc->text_length, "-%lds", seconds);
     } else if (dsc->id == LV_CHART_AXIS_SECONDARY_Y) {
-        long value = dsc->value;
-        long rounded_mbps = value >= 0 ? (value + 50) / 100 : (value - 50) / 100;
-        lv_snprintf(dsc->text, dsc->text_length, "%ld", rounded_mbps);
+        double mbps = (double)dsc->value * (double)s_chart_scale_bps /
+                      ((double)CHART_VALUE_LIMIT * 125000.0);
+        lv_snprintf(dsc->text, dsc->text_length, "%llu",
+                    (unsigned long long)(mbps + 0.5));
     }
 }
 
@@ -724,15 +752,23 @@ esp_err_t status_dashboard_init(void)
 
 static void format_rate(uint64_t bytes_per_second, char *output, size_t size)
 {
-    if (bytes_per_second >= 1024ULL * 1024ULL) {
-        uint64_t whole = bytes_per_second / (1024ULL * 1024ULL);
-        uint64_t fraction = ((bytes_per_second % (1024ULL * 1024ULL)) * 100) /
-                            (1024ULL * 1024ULL);
+    if (bytes_per_second == OPENWRT_TRAFFIC_UNAVAILABLE) {
+        snprintf(output, size, "--");
+        return;
+    }
+    if (bytes_per_second >= 1000ULL * 1000ULL) {
+        uint64_t whole = bytes_per_second / (1000ULL * 1000ULL);
+        uint64_t fraction = ((bytes_per_second % (1000ULL * 1000ULL)) * 100 +
+                             500000ULL) / (1000ULL * 1000ULL);
+        whole += fraction / 100;
+        fraction %= 100;
         snprintf(output, size, "%llu.%02llu MB/s", (unsigned long long)whole,
                  (unsigned long long)fraction);
-    } else if (bytes_per_second >= 1024ULL) {
-        uint64_t whole = bytes_per_second / 1024ULL;
-        uint64_t fraction = ((bytes_per_second % 1024ULL) * 10) / 1024ULL;
+    } else if (bytes_per_second >= 1000ULL) {
+        uint64_t whole = bytes_per_second / 1000ULL;
+        uint64_t fraction = ((bytes_per_second % 1000ULL) * 10 + 500ULL) / 1000ULL;
+        whole += fraction / 10;
+        fraction %= 10;
         snprintf(output, size, "%llu.%llu KB/s", (unsigned long long)whole,
                  (unsigned long long)fraction);
     } else {
@@ -742,6 +778,10 @@ static void format_rate(uint64_t bytes_per_second, char *output, size_t size)
 
 static void format_scaled_mbps(uint64_t hundredths, char *output, size_t size)
 {
+    if (hundredths == OPENWRT_TRAFFIC_UNAVAILABLE) {
+        snprintf(output, size, "--");
+        return;
+    }
     snprintf(output, size, "%llu.%02llu",
              (unsigned long long)(hundredths / 100ULL),
              (unsigned long long)(hundredths % 100ULL));
@@ -752,36 +792,32 @@ static void update_traffic_speed_labels(
 {
     if (history_slot < 0 || history_slot >= OPENWRT_MAX_INTERFACES) return;
     traffic_history_t *history = &s_interface_histories[history_slot];
-    uint64_t sum_down = 0, sum_up = 0;
-    uint32_t max_down = 0, max_up = 0;
-    for (uint32_t i = 0; i < history->count; ++i) {
-        sum_down += history->download[i];
-        sum_up += history->upload[i];
-        if (history->download[i] > max_down) max_down = history->download[i];
-        if (history->upload[i] > max_up) max_up = history->upload[i];
-    }
-    uint64_t avg_down = history->count ? sum_down / history->count : 0;
-    uint64_t avg_up = history->count ? sum_up / history->count : 0;
-    uint64_t current_down = interface ?
-                                (interface->download_bps + CHART_SCALE_DIVISOR / 2) /
-                                    CHART_SCALE_DIVISOR : 0;
-    uint64_t current_up = interface ?
-                              (interface->upload_bps + CHART_SCALE_DIVISOR / 2) /
-                                  CHART_SCALE_DIVISOR : 0;
-    char d_now[20], u_now[20], d_avg[20], u_avg[20], d_max[20], u_max[20];
-    char line[128];
-    format_scaled_mbps(current_down, d_now, sizeof(d_now));
-    format_scaled_mbps(current_up, u_now, sizeof(u_now));
-    format_scaled_mbps(avg_down, d_avg, sizeof(d_avg));
-    format_scaled_mbps(avg_up, u_avg, sizeof(u_avg));
-    format_scaled_mbps(max_down, d_max, sizeof(d_max));
-    format_scaled_mbps(max_up, u_max, sizeof(u_max));
+    int64_t now_us = esp_timer_get_time();
+    traffic_stats_t down = traffic_history_stats(history, now_us, false);
+    traffic_stats_t up = traffic_history_stats(history, now_us, true);
+    char d_now[24], u_now[24], d_avg[24], u_avg[24], d_max[24], u_max[24];
+    char line[160];
+    uint64_t current_down = interface ? interface->download_bps : OPENWRT_TRAFFIC_UNAVAILABLE;
+    uint64_t current_up = interface ? interface->upload_bps : OPENWRT_TRAFFIC_UNAVAILABLE;
+    format_scaled_mbps(current_down == OPENWRT_TRAFFIC_UNAVAILABLE ? current_down :
+                       (current_down + CHART_SCALE_DIVISOR / 2) / CHART_SCALE_DIVISOR,
+                       d_now, sizeof(d_now));
+    format_scaled_mbps(current_up == OPENWRT_TRAFFIC_UNAVAILABLE ? current_up :
+                       (current_up + CHART_SCALE_DIVISOR / 2) / CHART_SCALE_DIVISOR,
+                       u_now, sizeof(u_now));
+    format_scaled_mbps(down.valid ? (down.average + CHART_SCALE_DIVISOR / 2) /
+                       CHART_SCALE_DIVISOR : OPENWRT_TRAFFIC_UNAVAILABLE, d_avg, sizeof(d_avg));
+    format_scaled_mbps(up.valid ? (up.average + CHART_SCALE_DIVISOR / 2) /
+                       CHART_SCALE_DIVISOR : OPENWRT_TRAFFIC_UNAVAILABLE, u_avg, sizeof(u_avg));
+    format_scaled_mbps(down.valid ? (down.maximum + CHART_SCALE_DIVISOR / 2) /
+                       CHART_SCALE_DIVISOR : OPENWRT_TRAFFIC_UNAVAILABLE, d_max, sizeof(d_max));
+    format_scaled_mbps(up.valid ? (up.maximum + CHART_SCALE_DIVISOR / 2) /
+                       CHART_SCALE_DIVISOR : OPENWRT_TRAFFIC_UNAVAILABLE, u_max, sizeof(u_max));
     snprintf(line, sizeof(line), "D %s Mbps", d_now);
     set_label_if_changed(s_traffic_alert_rate, line);
     snprintf(line, sizeof(line), "U %s Mbps", u_now);
     set_label_if_changed(s_traffic_alert_upload_rate, line);
-    snprintf(line, sizeof(line), "AVG D/U %s/%s  MAX %s/%s",
-             d_avg, u_avg, d_max, u_max);
+    snprintf(line, sizeof(line), "AVG D/U %s/%s  MAX %s/%s", d_avg, u_avg, d_max, u_max);
     set_label_if_changed(s_traffic_alert_stats, line);
 }
 
@@ -789,26 +825,32 @@ static void format_total(uint64_t bytes, char *output, size_t size)
 {
     const char *unit;
     uint64_t divisor;
-    if (bytes >= 1024ULL * 1024ULL * 1024ULL * 1024ULL) {
-        divisor = 1024ULL * 1024ULL * 1024ULL * 1024ULL; unit = "TB";
-    } else if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
-        divisor = 1024ULL * 1024ULL * 1024ULL; unit = "GB";
-    } else if (bytes >= 1024ULL * 1024ULL) {
-        divisor = 1024ULL * 1024ULL; unit = "MB";
-    } else if (bytes >= 1024ULL) {
-        divisor = 1024ULL; unit = "KB";
+    if (bytes >= 1000ULL * 1000ULL * 1000ULL * 1000ULL) {
+        divisor = 1000ULL * 1000ULL * 1000ULL * 1000ULL; unit = "TB";
+    } else if (bytes >= 1000ULL * 1000ULL * 1000ULL) {
+        divisor = 1000ULL * 1000ULL * 1000ULL; unit = "GB";
+    } else if (bytes >= 1000ULL * 1000ULL) {
+        divisor = 1000ULL * 1000ULL; unit = "MB";
+    } else if (bytes >= 1000ULL) {
+        divisor = 1000ULL; unit = "KB";
     } else {
         snprintf(output, size, "TOTAL %llu B", (unsigned long long)bytes);
         return;
     }
     uint64_t whole = bytes / divisor;
-    uint64_t fraction = ((bytes % divisor) * 100) / divisor;
+    uint64_t fraction = ((bytes % divisor) * 100 + divisor / 2) / divisor;
+    whole += fraction / 100;
+    fraction %= 100;
     snprintf(output, size, "TOTAL %llu.%02llu %s", (unsigned long long)whole,
              (unsigned long long)fraction, unit);
 }
 
 static void format_tenths(float value, const char *suffix, char *output, size_t size)
 {
+    if (!isfinite(value)) {
+        snprintf(output, size, "--%s", suffix);
+        return;
+    }
     int scaled = value >= 0 ? (int)(value * 10.0f + 0.5f) : (int)(value * 10.0f - 0.5f);
     int absolute = scaled < 0 ? -scaled : scaled;
     snprintf(output, size, "%s%d.%d%s", scaled < 0 ? "-" : "",
@@ -825,15 +867,16 @@ static void format_uptime(uint64_t seconds, char *output, size_t size)
                   (unsigned long long)((seconds % 3600) / 60));
 }
 
-static uint32_t chart_value(uint64_t bytes_per_second)
-{
-    uint64_t value = bytes_per_second / CHART_SCALE_DIVISOR;
-    return value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
-}
-
 static int32_t rate_level(uint64_t bytes_per_second, uint64_t full_scale_bps)
 {
-    if (bytes_per_second >= full_scale_bps) return 100;
+    if (bytes_per_second == OPENWRT_TRAFFIC_UNAVAILABLE) return 0;
+    /* Expand each card's range in base-scale steps instead of clipping.
+     * For example, 15 MB/s uses a 20 MB/s range and a 75% liquid level. */
+    if (bytes_per_second > full_scale_bps) {
+        uint64_t steps = bytes_per_second / full_scale_bps +
+                         (bytes_per_second % full_scale_bps != 0);
+        full_scale_bps *= steps;
+    }
     return (int32_t)((bytes_per_second * 100ULL + full_scale_bps / 2ULL) /
                      full_scale_bps);
 }
@@ -873,18 +916,40 @@ static const openwrt_interface_status_t *default_page_interface(
     return selected;
 }
 
+static void reset_history_slot(int slot)
+{
+    if (s_manual_history_slot == slot) s_manual_history_slot = -1;
+    if (s_visible_history_slot == slot) {
+        s_visible_history_slot = -1;
+        s_was_high_traffic = false;
+    }
+    if (s_wan_history_slot == slot) s_wan_history_slot = -1;
+    if (s_chart_history_slot == slot) s_chart_history_slot = -1;
+    if (s_default_interface_locked &&
+        strcmp(s_locked_interface_name, s_interface_histories[slot].name) == 0) {
+        s_default_interface_locked = false;
+        s_locked_interface_name[0] = '\0';
+    }
+    memset(&s_interface_histories[slot], 0, sizeof(s_interface_histories[slot]));
+}
+
 static int find_history_slot(const char *name, bool create)
 {
-    int free_slot = -1;
+    int free_slot = -1, oldest_slot = -1;
     for (int i = 0; i < OPENWRT_MAX_INTERFACES; ++i) {
-        if (s_interface_histories[i].name[0] &&
-            strcmp(s_interface_histories[i].name, name) == 0) return i;
-        if (free_slot < 0 && !s_interface_histories[i].name[0]) free_slot = i;
+        traffic_history_t *history = &s_interface_histories[i];
+        if (history->name[0] && strcmp(history->name, name) == 0) return i;
+        if (free_slot < 0 && !history->name[0]) free_slot = i;
+        if (!history->active && (oldest_slot < 0 ||
+            history->last_seen_us < s_interface_histories[oldest_slot].last_seen_us))
+            oldest_slot = i;
     }
-    if (!create || free_slot < 0) return -1;
-    strlcpy(s_interface_histories[free_slot].name, name,
-            sizeof(s_interface_histories[free_slot].name));
-    return free_slot;
+    if (!create) return -1;
+    int slot = free_slot >= 0 ? free_slot : oldest_slot;
+    if (slot < 0) return -1;
+    reset_history_slot(slot);
+    strlcpy(s_interface_histories[slot].name, name, sizeof(s_interface_histories[slot].name));
+    return slot;
 }
 
 static const openwrt_interface_status_t *status_interface_for_slot(
@@ -901,10 +966,23 @@ static const openwrt_interface_status_t *status_interface_for_slot(
 
 static bool append_traffic_samples(const openwrt_status_t *status)
 {
-    if (!status->sample_id || status->sample_id == s_last_sample_id) return false;
+    if (status->history_generation && status->history_generation != s_history_generation) {
+        for (int slot = 0; slot < OPENWRT_MAX_INTERFACES; ++slot) reset_history_slot(slot);
+        s_history_generation = status->history_generation;
+        s_last_sample_id = 0;
+    }
+    if (!status->valid || !status->sample_id || status->sample_id == s_last_sample_id)
+        return false;
     s_last_sample_id = status->sample_id;
-    for (int i = 0; i < OPENWRT_MAX_INTERFACES; ++i) {
-        s_interface_histories[i].active = false;
+    /* Protect ALL names present in this response before allocating new slots.
+     * An earlier new name must not evict a later, still-active interface. */
+    for (int slot = 0; slot < OPENWRT_MAX_INTERFACES; ++slot) {
+        traffic_history_t *history = &s_interface_histories[slot];
+        history->active = false;
+        for (uint8_t i = 0; i < status->interface_count; ++i) {
+            if (history->name[0] && strcmp(history->name, status->interfaces[i].name) == 0)
+                history->active = true;
+        }
     }
     s_wan_history_slot = -1;
     for (uint8_t i = 0; i < status->interface_count; ++i) {
@@ -912,26 +990,30 @@ static bool append_traffic_samples(const openwrt_status_t *status)
         int slot = find_history_slot(interface->name, true);
         if (slot < 0) continue;
         traffic_history_t *history = &s_interface_histories[slot];
+        if (history->ifindex && interface->ifindex && history->ifindex != interface->ifindex) {
+            reset_history_slot(slot);
+            strlcpy(history->name, interface->name, sizeof(history->name));
+        }
+        history->ifindex = interface->ifindex;
         history->active = true;
-        history->download[history->index] = chart_value(interface->download_bps);
-        history->upload[history->index] = chart_value(interface->upload_bps);
-        history->index = (history->index + 1) % TRAFFIC_HISTORY_SECONDS;
-        if (history->count < TRAFFIC_HISTORY_SECONDS) history->count++;
+        traffic_history_append(history, status, interface);
         if ((int)i == status->wan_interface_index) s_wan_history_slot = slot;
     }
-    if (s_manual_history_slot >= 0 &&
-        !s_interface_histories[s_manual_history_slot].active) {
+    if (s_manual_history_slot >= 0 && !s_interface_histories[s_manual_history_slot].active)
         s_manual_history_slot = -1;
-    }
     return true;
 }
 
 void status_dashboard_update(void)
 {
-    if (atomic_load(&s_render_paused)) return;
     static openwrt_status_t status;
     memset(&status, 0, sizeof(status));
     openwrt_status_get(&status);
+    bool new_traffic_sample = append_traffic_samples(&status);
+    int64_t redraw_second = esp_timer_get_time() / TRAFFIC_SECOND_US;
+    bool time_advanced = redraw_second != s_last_redraw_second;
+    s_last_redraw_second = redraw_second;
+    if (atomic_load(&s_render_paused)) return;
     char text[64];
 
     board_display_lock();
@@ -939,13 +1021,26 @@ void status_dashboard_update(void)
         s_current_default_interface_name[0] = '\0';
         update_lock_indicator();
         lv_anim_del(&s_redraw_animation, NULL);
+        set_label_if_changed(s_cpu, "--%");
+        set_label_if_changed(s_memory, "--%");
+        set_label_if_changed(s_temperature, "-- C");
+        set_liquid_level(&s_cpu_liquid, 0);
+        set_liquid_level(&s_memory_liquid, 0);
+        set_liquid_level(&s_temperature_liquid, 0);
+        set_label_if_changed(s_download_speed, "--");
+        set_label_if_changed(s_upload_speed, "--");
+        set_label_if_changed(s_download_total, "TOTAL --");
+        set_label_if_changed(s_upload_total, "TOTAL --");
+        set_liquid_level(&s_download_liquid, 0);
+        set_liquid_level(&s_upload_liquid, 0);
         if (s_manual_history_slot >= 0) {
+            if (time_advanced) start_waveform_redraw(s_manual_history_slot, false);
             lv_label_set_text(s_traffic_alert_title,
                               s_interface_histories[s_manual_history_slot].name);
             lv_label_set_text(s_traffic_alert_rate,
                               status.message[0] ? status.message : "NO DATA");
             lv_label_set_text(s_traffic_alert_upload_rate, "");
-            lv_label_set_text(s_traffic_alert_stats, "AVG D/U --/--  MAX --/--");
+            update_traffic_speed_labels(s_manual_history_slot, NULL);
             set_traffic_page_visible(true);
         } else {
             s_was_high_traffic = false;
@@ -964,46 +1059,52 @@ void status_dashboard_update(void)
     lv_obj_set_style_text_color(s_connection, lv_color_hex(0x44D7B6), 0);
     format_tenths(status.cpu_percent, "%", text, sizeof(text));
     set_label_if_changed(s_cpu, text);
-    set_liquid_level(&s_cpu_liquid, (int32_t)(status.cpu_percent + 0.5f));
+    set_liquid_level(&s_cpu_liquid, isfinite(status.cpu_percent) ?
+                     (int32_t)(status.cpu_percent + 0.5f) : 0);
     format_tenths(status.memory_percent, "%", text, sizeof(text));
     set_label_if_changed(s_memory, text);
-    set_liquid_level(&s_memory_liquid, (int32_t)(status.memory_percent + 0.5f));
+    set_liquid_level(&s_memory_liquid, isfinite(status.memory_percent) ?
+                     (int32_t)(status.memory_percent + 0.5f) : 0);
     format_tenths(status.temperature_c, " C", text, sizeof(text));
     set_label_if_changed(s_temperature, text);
-    set_liquid_level(&s_temperature_liquid, (int32_t)(status.temperature_c + 0.5f));
+    set_liquid_level(&s_temperature_liquid, isfinite(status.temperature_c) ?
+                     (int32_t)(status.temperature_c + 0.5f) : 0);
     format_uptime(status.uptime_seconds, text, sizeof(text));
     set_label_if_changed(s_uptime, text);
-    uint64_t default_download_bps = default_interface ? default_interface->download_bps : 0;
-    uint64_t default_upload_bps = default_interface ? default_interface->upload_bps : 0;
-    uint64_t default_download_bytes = default_interface ? default_interface->download_bytes : 0;
-    uint64_t default_upload_bytes = default_interface ? default_interface->upload_bytes : 0;
+    uint64_t default_download_bps = default_interface ? default_interface->download_bps : OPENWRT_TRAFFIC_UNAVAILABLE;
+    uint64_t default_upload_bps = default_interface ? default_interface->upload_bps : OPENWRT_TRAFFIC_UNAVAILABLE;
+    uint64_t default_download_bytes = default_interface ? default_interface->download_bytes : OPENWRT_TRAFFIC_UNAVAILABLE;
+    uint64_t default_upload_bytes = default_interface ? default_interface->upload_bytes : OPENWRT_TRAFFIC_UNAVAILABLE;
     format_rate(default_download_bps, text, sizeof(text));
     set_label_if_changed(s_download_speed, text);
     set_liquid_level(&s_download_liquid,
                      rate_level(default_download_bps, DOWNLOAD_FULL_SCALE_BPS));
-    format_total(default_download_bytes, text, sizeof(text));
+    if (default_interface && default_interface->download_bytes_valid)
+        format_total(default_download_bytes, text, sizeof(text));
+    else snprintf(text, sizeof(text), "TOTAL --");
     set_label_if_changed(s_download_total, text);
     format_rate(default_upload_bps, text, sizeof(text));
     set_label_if_changed(s_upload_speed, text);
     set_liquid_level(&s_upload_liquid,
                      rate_level(default_upload_bps, UPLOAD_FULL_SCALE_BPS));
-    format_total(default_upload_bytes, text, sizeof(text));
+    if (default_interface && default_interface->upload_bytes_valid)
+        format_total(default_upload_bytes, text, sizeof(text));
+    else snprintf(text, sizeof(text), "TOTAL --");
     set_label_if_changed(s_upload_total, text);
 
-    /* Keep a continuous one-sample-per-second history.  The traffic threshold
-     * only controls whether the waveform page is visible; it no longer
-     * controls collection, so a spike can show the preceding normal traffic. */
-    bool new_traffic_sample = append_traffic_samples(&status);
+    /* History collection runs independently of page rendering. */
     bool high_download = FULLSCREEN_TRAFFIC_ENABLED &&
                          s_wan_history_slot >= 0 &&
+                         status.wan_download_bps != OPENWRT_TRAFFIC_UNAVAILABLE &&
                          status.wan_download_bps >= HIGH_TRAFFIC_THRESHOLD_BPS;
     bool high_upload = FULLSCREEN_TRAFFIC_ENABLED &&
                        s_wan_history_slot >= 0 &&
+                       status.wan_upload_bps != OPENWRT_TRAFFIC_UNAVAILABLE &&
                        status.wan_upload_bps >= HIGH_TRAFFIC_THRESHOLD_BPS;
     int display_slot = s_manual_history_slot >= 0 ? s_manual_history_slot :
                        ((high_download || high_upload) ? s_wan_history_slot : -1);
     if (display_slot >= 0) {
-        if (new_traffic_sample || !s_was_high_traffic ||
+        if (new_traffic_sample || time_advanced || !s_was_high_traffic ||
             s_visible_history_slot != display_slot) {
             start_waveform_redraw(display_slot, !s_was_high_traffic ||
                                                s_visible_history_slot != display_slot);

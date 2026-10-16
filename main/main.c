@@ -16,6 +16,27 @@
 static const char *TAG = "main";
 
 #define DISPLAY_DIM_DELAY_MS 60000
+#define DISPLAY_OFF_DELAY_MS (10U * 60U * 1000U)
+
+static void update_display_idle(TickType_t now, TickType_t last_activity,
+                                bool *dimmed)
+{
+    if (board_display_is_off()) return;
+    TickType_t idle_ticks = now - last_activity;
+    if (idle_ticks >= pdMS_TO_TICKS(DISPLAY_OFF_DELAY_MS)) {
+        esp_err_t err = board_display_set_power(false);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Display idle for 10 minutes: LCD and backlight off");
+        } else {
+            ESP_LOGE(TAG, "Display off failed: %s", esp_err_to_name(err));
+        }
+    } else if (!*dimmed && idle_ticks >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS)) {
+        board_display_set_brightness(25);
+        *dimmed = true;
+        ESP_LOGI(TAG, "Display idle: brightness reduced to 25%%");
+    }
+}
+
 #define DISPLAY_TASK_STACK_SIZE 6144
 #define DISPLAY_TASK_PRIORITY 5
 #define NETWORK_CORE 0
@@ -85,11 +106,6 @@ static void display_task(void *arg)
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        if (!display_dimmed && now - display_started >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS)) {
-            board_display_set_brightness(25);
-            display_dimmed = true;
-            ESP_LOGI(TAG, "Display idle: brightness reduced to 25%%");
-        }
         if (now - last_update >= pdMS_TO_TICKS(500)) {
             static openwrt_status_t status;
             memset(&status, 0, sizeof(status));
@@ -125,12 +141,14 @@ static void display_task(void *arg)
                 set_screensaver(SCREENSAVER_NONE, &active_screensaver);
                 ESP_LOGI(TAG, "Screensaver dismissed; dashboard resumed");
             }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(board_display_set_power(true));
             board_display_set_brightness(50);
             display_started = now;
             display_dimmed = false;
             ESP_LOGI(TAG, "%s: brightness set to 50%%; dim timer reset",
                      screensaver_dismissed ? "User activity" : "Manual page switch");
         }
+        update_display_idle(now, display_started, &display_dimmed);
         int64_t handler_started = esp_timer_get_time();
         status_dashboard_animate_frame();
         board_display_handle();

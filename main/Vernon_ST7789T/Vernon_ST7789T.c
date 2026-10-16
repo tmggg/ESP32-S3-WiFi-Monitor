@@ -302,6 +302,5 @@ static esp_err_t panel_st7789t_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
     } else {
         command = LCD_CMD_DISPOFF;
     }
-    esp_lcd_panel_io_tx_param(io, command, NULL, 0);
-    return ESP_OK;
+    return esp_lcd_panel_io_tx_param(io, command, NULL, 0);
 }

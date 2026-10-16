@@ -1,4 +1,5 @@
 #include "boot_button.h"
+#include "board_display.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -17,10 +18,16 @@ static void button_task(void *arg)
     bool fired = false;
     bool click_pending = false;
     bool second_press = false;
+    bool wake_only = false;
     TickType_t first_release_tick = 0;
     while (true) {
         TickType_t now = xTaskGetTickCount();
         if (gpio_get_level(CONFIG_PROV_BOOT_BUTTON_GPIO) == 0) {
+            if (held_ms == 0 && board_display_is_off()) {
+                status_dashboard_request_wake();
+                wake_only = true;
+                click_pending = false;
+            }
             if (held_ms == 0 && click_pending) {
                 if (now - first_release_tick <= pdMS_TO_TICKS(BOOT_DOUBLE_CLICK_MS)) {
                     second_press = true;
@@ -39,7 +46,9 @@ static void button_task(void *arg)
             }
         } else {
             if (held_ms >= 50 && !fired) {
-                if (second_press && click_pending) {
+                if (wake_only) {
+                    click_pending = false;
+                } else if (second_press && click_pending) {
                     ESP_LOGI(TAG, "BOOT double-click: toggling interface rotation lock");
                     status_dashboard_request_interface_lock_toggle();
                     click_pending = false;
@@ -54,6 +63,7 @@ static void button_task(void *arg)
             held_ms = 0;
             fired = false;
             second_press = false;
+            wake_only = false;
             if (click_pending && now - first_release_tick >=
                                      pdMS_TO_TICKS(BOOT_DOUBLE_CLICK_MS)) {
                 ESP_LOGI(TAG, "BOOT pressed: toggling dashboard page");

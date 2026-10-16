@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -8,6 +9,9 @@ void board_display_lock(void);
 void board_display_unlock(void);
 void board_display_handle(void);
 void board_display_set_brightness(uint8_t percent);
+/* Display task owns power changes; input tasks may query the atomic state. */
+esp_err_t board_display_set_power(bool on);
+bool board_display_is_off(void);
 
 typedef struct {
     uint32_t refreshes;

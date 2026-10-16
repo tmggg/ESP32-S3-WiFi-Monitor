@@ -38,6 +38,7 @@ static lv_disp_drv_t s_disp_drv;
 static DMA_ATTR lv_color_t s_buffer_1[LCD_H_RES * LCD_DRAW_LINES];
 static DMA_ATTR lv_color_t s_buffer_2[LCD_H_RES * LCD_DRAW_LINES];
 static SemaphoreHandle_t s_lvgl_lock;
+static atomic_bool s_display_off;
 static atomic_uint s_refreshes;
 static atomic_uint s_flushes;
 static atomic_uint s_dma_completed;
@@ -116,10 +117,32 @@ static esp_err_t init_backlight(void)
 
 void board_display_set_brightness(uint8_t percent)
 {
+    if (atomic_load(&s_display_off)) percent = 0;
     if (percent > 100) percent = 100;
     uint32_t duty = (8191U * percent) / 100U;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+bool board_display_is_off(void)
+{
+    return atomic_load(&s_display_off);
+}
+
+esp_err_t board_display_set_power(bool on)
+{
+    board_display_lock();
+    if (on == !atomic_load(&s_display_off)) {
+        board_display_unlock();
+        return ESP_OK;
+    }
+    /* Disable the backlight before DISPOFF. The caller restores brightness
+     * after DISPON; all panel commands stay serialized with LVGL flushes. */
+    if (!on) board_display_set_brightness(0);
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_panel, on);
+    if (err == ESP_OK) atomic_store(&s_display_off, !on);
+    board_display_unlock();
+    return err;
 }
 
 esp_err_t board_display_init(void)
